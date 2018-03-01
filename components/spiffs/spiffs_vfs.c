@@ -17,21 +17,20 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
-#include "esp_log.h"
-
-#include <sys/stat.h>
-
-#include "esp_vfs.h"
-#include "esp_attr.h"
 #include <errno.h>
-
-#include <spiffs_vfs.h>
-#include <spiffs.h>
-#include <esp_spiffs.h>
-#include <spiffs_nucleus.h>
-#include "list.h"
+#include <sys/stat.h>
 #include <sys/fcntl.h>
 #include <sys/dirent.h>
+
+#include "esp_log.h"
+#include "esp_partition.h"
+#include "esp_vfs.h"
+#include "esp_attr.h"
+#include "rom/spi_flash.h"
+
+#include "spiffs_vfs.h"
+#include "spiffs.h"
+#include "spiffs_nucleus.h"
 #include "sdkconfig.h"
 
 
@@ -42,15 +41,25 @@
 
 #define SPIFFS_ERASE_SIZE 4096
 
+#define MAX_SPIFFS_FILES 8
+
 int spiffs_is_registered = 0;
 int spiffs_is_mounted = 0;
+uint32_t max_lock = 0;
+uint32_t max_file_lock = 0;
+uint32_t max_w_time = 0;
+uint32_t max_r_time = 0;
+uint32_t max_o_time = 0;
 
-static int IRAM_ATTR vfs_spiffs_open(const char *path, int flags, int mode);
-static size_t IRAM_ATTR vfs_spiffs_write(int fd, const void *data, size_t size);
-static ssize_t IRAM_ATTR vfs_spiffs_read(int fd, void * dst, size_t size);
-static int IRAM_ATTR vfs_spiffs_fstat(int fd, struct stat * st);
-static int IRAM_ATTR vfs_spiffs_close(int fd);
-static off_t IRAM_ATTR vfs_spiffs_lseek(int fd, off_t size, int mode);
+static SemaphoreHandle_t lock = NULL; /*!< FS lock */
+static SemaphoreHandle_t file_lock = NULL; /*!< FS lock */
+
+static int vfs_spiffs_open(const char *path, int flags, int mode);
+static ssize_t vfs_spiffs_write(int fd, const void *data, size_t size);
+static ssize_t vfs_spiffs_read(int fd, void * dst, size_t size);
+static int vfs_spiffs_fstat(int fd, struct stat * st);
+static int vfs_spiffs_close(int fd);
+static off_t vfs_spiffs_lseek(int fd, off_t size, int mode);
 
 typedef struct {
 	DIR dir;
@@ -61,10 +70,10 @@ typedef struct {
 } vfs_spiffs_dir_t;
 
 typedef struct {
-	spiffs_file spiffs_file;
-	char path[MAXNAMLEN + 1];
-	uint8_t is_dir;
-} vfs_spiffs_file_t;
+	int        spiffs_file;
+	char       path[MAXNAMLEN + 1];
+	uint8_t    is_dir;
+} vfsspiffs_file_t;
 
 typedef struct {
 	time_t mtime;
@@ -74,12 +83,23 @@ typedef struct {
 } spiffs_metadata_t;
 
 static spiffs fs;
-static struct list files;
+
+static vfsspiffs_file_t *files[MAX_SPIFFS_FILES] = {NULL};
+
+static esp_partition_t fs_part = {
+    ESP_PARTITION_TYPE_DATA,            //type
+    ESP_PARTITION_SUBTYPE_DATA_SPIFFS,  //subtype
+    CONFIG_SPIFFS_BASE_ADDR,            // starting address
+    CONFIG_SPIFFS_SIZE,                 // size
+    "spiffspart",                       // label
+    0                                   // not encrypted
+};
 
 static u8_t *my_spiffs_work_buf;
 static u8_t *my_spiffs_fds;
 static u8_t *my_spiffs_cache;
 
+static const char tag[] = "[SPIFFS_VFS]";
 
 /*
  * ########################################
@@ -87,6 +107,22 @@ static u8_t *my_spiffs_cache;
  * do not contain '/spiffs' prefix
  * ########################################
  */
+
+//-----------------------------
+void spiffs_api_file_lock(void)
+{
+    uint32_t start = clock();
+    xSemaphoreTake(file_lock, portMAX_DELAY);
+    start = clock()-start;
+    if (start > max_file_lock) max_file_lock=start;
+}
+
+//-------------------------------
+void spiffs_api_file_unlock(void)
+{
+    xSemaphoreGive(file_lock);
+}
+
 
 //----------------------------------------------------
 void spiffs_fs_stat(uint32_t *total, uint32_t *used) {
@@ -134,7 +170,7 @@ static int is_dir(const char *path) {
  * This function translate error codes from SPIFFS to errno error codes
  *
  */
-//-------------------------------
+//---------------------------------
 static int spiffs_result(int res) {
     switch (res) {
         case SPIFFS_OK:
@@ -157,8 +193,8 @@ static int spiffs_result(int res) {
     }
 }
 
-//-----------------------------------------------------------------------------------------------------
-static int IRAM_ATTR vfs_spiffs_getstat(spiffs_file fd, spiffs_stat *st, spiffs_metadata_t *metadata) {
+//-------------------------------------------------------------------------------------------
+static int vfs_spiffs_getstat(spiffs_file fd, spiffs_stat *st, spiffs_metadata_t *metadata) {
     int res = SPIFFS_fstat(&fs, fd, st);
     if (res == SPIFFS_OK) {
         // Get file's time information from metadata
@@ -168,24 +204,32 @@ static int IRAM_ATTR vfs_spiffs_getstat(spiffs_file fd, spiffs_stat *st, spiffs_
 }
 
 // ## path does not contain '/spiffs' prefix !
-//---------------------------------------------------------------------------
-static int IRAM_ATTR vfs_spiffs_open(const char *path, int flags, int mode) {
+//-----------------------------------------------------------------
+static int vfs_spiffs_open(const char *path, int flags, int mode) {
+    uint32_t tstart = clock();
 	int fd, result = 0, exists = 0;
 	spiffs_stat stat;
 	spiffs_metadata_t meta;
 
 	// Allocate new file
-	vfs_spiffs_file_t *file = calloc(1, sizeof(vfs_spiffs_file_t));
+	vfsspiffs_file_t *file = calloc(1, sizeof(vfsspiffs_file_t));
 	if (!file) {
 		errno = ENOMEM;
 		return -1;
 	}
 
+    spiffs_api_file_lock();
     // Add file to file list. List index is file descriptor.
-    int res = list_add(&files, file, &fd);
-    if (res) {
+    for (fd=0; fd<MAX_SPIFFS_FILES; fd++) {
+        if (files[fd] == NULL) {
+            files[fd] = file;
+            break;
+        }
+    }
+    if (fd == MAX_SPIFFS_FILES) { 
     	free(file);
-    	errno = res;
+    	errno = ENOMEM;
+        spiffs_api_file_unlock();
     	return -1;
     }
 
@@ -228,7 +272,7 @@ static int IRAM_ATTR vfs_spiffs_open(const char *path, int flags, int mode) {
         	strlcat(npath,".", PATH_MAX);
         }
 
-        // Open SPIFFS file
+        // Open SPIFFS directory
         file->spiffs_file = SPIFFS_open(&fs, npath, spiffs_mode, 0);
         if (file->spiffs_file < 0) {
             result = spiffs_result(fs.err_code);
@@ -244,98 +288,115 @@ static int IRAM_ATTR vfs_spiffs_open(const char *path, int flags, int mode) {
     }
 
     if (result != 0) {
-    	list_remove(&files, fd, 1);
+        files[fd] = NULL;
+        free(file);
     	errno = result;
+        spiffs_api_file_unlock();
     	return -1;
     }
 
-    res = vfs_spiffs_getstat(file->spiffs_file, &stat, &meta);
+    /*int res = vfs_spiffs_getstat(file->spiffs_file, &stat, &meta);
 	if (res == SPIFFS_OK) {
 		// update file's time information
 		meta.atime = time(NULL); // Get the system time to access time
 		if (!exists) meta.ctime = meta.atime;
 		if (spiffs_mode != SPIFFS_RDONLY) meta.mtime = meta.atime;
 		SPIFFS_fupdate_meta(&fs, file->spiffs_file, &meta);
-	}
+	}*/
 
+    spiffs_api_file_unlock();
     return fd;
 }
 
-//-------------------------------------------------------------------------------
-static size_t IRAM_ATTR vfs_spiffs_write(int fd, const void *data, size_t size) {
-	vfs_spiffs_file_t *file;
+//----------------------------------------------------------------------
+static ssize_t vfs_spiffs_write(int fd, const void *data, size_t size) {
+    spiffs_api_file_lock();
+	vfsspiffs_file_t *file = files[fd];
 	int res;
 
-    res = list_get(&files, fd, (void **)&file);
-    if (res) {
+    if (file == NULL) {
+        spiffs_api_file_unlock();
 		errno = EBADF;
 		return -1;
     }
 
     if (file->is_dir) {
 		errno = EBADF;
+        spiffs_api_file_unlock();
 		return -1;
     }
 
     // Write SPIFFS file
 	res = SPIFFS_write(&fs, file->spiffs_file, (void *)data, size);
 	if (res >= 0) {
+        spiffs_api_file_unlock();
 		return res;
-	} else {
+	}
+	else {
 		res = spiffs_result(fs.err_code);
 		if (res != 0) {
 			errno = res;
+            spiffs_api_file_unlock();
 			return -1;
 		}
 	}
 
+    spiffs_api_file_unlock();
 	return -1;
 }
 
-//-------------------------------------------------------------------------
-static ssize_t IRAM_ATTR vfs_spiffs_read(int fd, void * dst, size_t size) {
-	vfs_spiffs_file_t *file;
+//---------------------------------------------------------------
+static ssize_t vfs_spiffs_read(int fd, void * dst, size_t size) {
+    spiffs_api_file_lock();
+	vfsspiffs_file_t *file = files[fd];
 	int res;
 
-    res = list_get(&files, fd, (void **)&file);
-    if (res) {
+    if (file == NULL) {
 		errno = EBADF;
+        spiffs_api_file_unlock();
 		return -1;
     }
 
     if (file->is_dir) {
 		errno = EBADF;
+        spiffs_api_file_unlock();
 		return -1;
     }
 
     // Read SPIFFS file
 	res = SPIFFS_read(&fs, file->spiffs_file, dst, size);
 	if (res >= 0) {
+        spiffs_api_file_unlock();
 		return res;
-	} else {
+	}
+	else {
 		res = spiffs_result(fs.err_code);
 		if (res != 0) {
 			errno = res;
+            spiffs_api_file_unlock();
 			return -1;
 		}
 
 		// EOF
+        spiffs_api_file_unlock();
 		return 0;
 	}
 
+    spiffs_api_file_unlock();
 	return -1;
 }
 
-//---------------------------------------------------------------
-static int IRAM_ATTR vfs_spiffs_fstat(int fd, struct stat * st) {
-	vfs_spiffs_file_t *file;
+//-----------------------------------------------------
+static int vfs_spiffs_fstat(int fd, struct stat * st) {
+    spiffs_api_file_lock();
+	vfsspiffs_file_t *file = files[fd];
     spiffs_stat stat;
 	int res;
 	spiffs_metadata_t meta;
 
-    res = list_get(&files, fd, (void **)&file);
-    if (res) {
+    if (file == NULL) {
 		errno = EBADF;
+        spiffs_api_file_unlock();
 		return -1;
     }
 
@@ -352,13 +413,15 @@ static int IRAM_ATTR vfs_spiffs_fstat(int fd, struct stat * st) {
 
     	st->st_size = stat.size;
 
-	} else {
+	}
+	else {
         st->st_mtime = 0;
         st->st_ctime = 0;
         st->st_atime = 0;
 		st->st_size = 0;
 	    errno = spiffs_result(fs.err_code);
 		//printf("SPIFFS_STAT: error %d\r\n", res);
+        spiffs_api_file_unlock();
     	return -1;
     }
 
@@ -366,17 +429,19 @@ static int IRAM_ATTR vfs_spiffs_fstat(int fd, struct stat * st) {
     if (file->is_dir) st->st_mode = S_IFDIR;
     else st->st_mode = S_IFREG;
 
+    spiffs_api_file_unlock();
     return 0;
 }
 
-//---------------------------------------------
-static int IRAM_ATTR vfs_spiffs_close(int fd) {
-	vfs_spiffs_file_t *file;
+//-----------------------------------
+static int vfs_spiffs_close(int fd) {
+    spiffs_api_file_lock();
+	vfsspiffs_file_t *file = files[fd];
 	int res;
 
-    res = list_get(&files, fd, (void **)&file);
-    if (res) {
+    if (file == NULL) {
 		errno = EBADF;
+        spiffs_api_file_unlock();
 		return -1;
     }
 
@@ -387,50 +452,57 @@ static int IRAM_ATTR vfs_spiffs_close(int fd) {
 
 	if (res < 0) {
 		errno = res;
+        spiffs_api_file_unlock();
 		return -1;
 	}
 
-	list_remove(&files, fd, 1);
+    free(files[fd]);
+    files[fd] = NULL;
 
+    spiffs_api_file_unlock();
 	return 0;
 }
 
-//---------------------------------------------------------------------
-static off_t IRAM_ATTR vfs_spiffs_lseek(int fd, off_t size, int mode) {
-	vfs_spiffs_file_t *file;
+//-----------------------------------------------------------
+static off_t vfs_spiffs_lseek(int fd, off_t size, int mode) {
+    spiffs_api_file_lock();
+	vfsspiffs_file_t *file = files[fd];
 	int res;
 
-    res = list_get(&files, fd, (void **)&file);
-    if (res) {
+    if (file == NULL) {
 		errno = EBADF;
+        spiffs_api_file_unlock();
 		return -1;
     }
 
     if (file->is_dir) {
 		errno = EBADF;
+        spiffs_api_file_unlock();
 		return -1;
     }
 
 	int whence = SPIFFS_SEEK_CUR;
 
     switch (mode) {
-        case SEEK_SET: whence = SPIFFS_SEEK_SET;break;
-        case SEEK_CUR: whence = SPIFFS_SEEK_CUR;break;
-        case SEEK_END: whence = SPIFFS_SEEK_END;break;
+        case SEEK_SET: whence = SPIFFS_SEEK_SET; break;
+        case SEEK_CUR: whence = SPIFFS_SEEK_CUR; break;
+        case SEEK_END: whence = SPIFFS_SEEK_END; break;
     }
 
     res = SPIFFS_lseek(&fs, file->spiffs_file, size, whence);
     if (res < 0) {
         res = spiffs_result(fs.err_code);
         errno = res;
+        spiffs_api_file_unlock();
         return -1;
     }
 
+    spiffs_api_file_unlock();
     return res;
 }
 
-//-------------------------------------------------------------------------
-static int IRAM_ATTR vfs_spiffs_stat(const char * path, struct stat * st) {
+//---------------------------------------------------------------
+static int vfs_spiffs_stat(const char * path, struct stat * st) {
 	int fd;
 	int res;
 	fd = vfs_spiffs_open(path, 0, 0);
@@ -441,7 +513,7 @@ static int IRAM_ATTR vfs_spiffs_stat(const char * path, struct stat * st) {
 }
 
 //--------------------------------------------------------
-static int IRAM_ATTR vfs_spiffs_unlink(const char *path) {
+static int vfs_spiffs_unlink(const char *path) {
     char npath[PATH_MAX + 1];
 
     strlcpy(npath, path, PATH_MAX);
@@ -499,7 +571,7 @@ static int IRAM_ATTR vfs_spiffs_unlink(const char *path) {
 }
 
 //------------------------------------------------------------------------
-static int IRAM_ATTR vfs_spiffs_rename(const char *src, const char *dst) {
+static int vfs_spiffs_rename(const char *src, const char *dst) {
     if (SPIFFS_rename(&fs, src, dst) < 0) {
     	errno = spiffs_result(fs.err_code);
     	return -1;
@@ -658,7 +730,7 @@ static struct dirent* vfs_spiffs_readdir(DIR* pdir) {
 }
 
 //--------------------------------------------------
-static int IRAM_ATTR vfs_piffs_closedir(DIR* pdir) {
+static int vfs_piffs_closedir(DIR* pdir) {
 	vfs_spiffs_dir_t* dir = (vfs_spiffs_dir_t*) pdir;
 	int res;
 
@@ -678,7 +750,7 @@ static int IRAM_ATTR vfs_piffs_closedir(DIR* pdir) {
 }
 
 //--------------------------------------------------------------------
-static int IRAM_ATTR vfs_spiffs_mkdir(const char *path, mode_t mode) {
+static int vfs_spiffs_mkdir(const char *path, mode_t mode) {
     char npath[PATH_MAX + 1];
     int res;
 
@@ -710,8 +782,63 @@ static int IRAM_ATTR vfs_spiffs_mkdir(const char *path, mode_t mode) {
     return 0;
 }
 
+//------------------------
+void spiffs_api_lock(void)
+{
+    uint32_t start = clock();
+    xSemaphoreTake(lock, portMAX_DELAY);
+    start = clock()-start;
+    if (start > max_lock) max_lock=start;
+}
 
-static const char tag[] = "[SPIFFS]";
+//--------------------------
+void spiffs_api_unlock(void)
+{
+    xSemaphoreGive(lock);
+}
+
+//----------------------------------------------------------------------
+static s32_t spiffs_api_read(uint32_t addr, uint32_t size, uint8_t *dst)
+{
+    /*
+    esp_err_t err = spi_flash_read(fs_part.address + addr, dst, size);
+    if (err) {
+        ESP_LOGE(tag, "failed to read addr %08x (%08x), size %08x, err %d", fs_part.address+addr, addr, size, err);
+        return -1;
+    }
+    return 0;
+    */
+
+    esp_err_t err = esp_partition_read(&fs_part, addr, dst, size);
+    if (err) {
+        ESP_LOGE(tag, "failed to read addr %08x, size %08x, err %d", addr, size, err);
+        return -1;
+    }
+    return 0;
+}
+
+//-----------------------------------------------------------------------
+static s32_t spiffs_api_write(uint32_t addr, uint32_t size, uint8_t *src)
+{
+    esp_err_t err = esp_partition_write(&fs_part, addr, src, size);
+    if (err) {
+        ESP_LOGE(tag, "failed to write addr %08x, size %08x, err %d", addr, size, err);
+        return -1;
+    }
+    return 0;
+}
+
+//---------------------------------------------------------
+static s32_t spiffs_api_erase(uint32_t addr, uint32_t size)
+{
+    esp_err_t err = esp_partition_erase_range(&fs_part, addr, size);
+    if (err) {
+        ESP_LOGE(tag, "failed to erase addr %08x, size %08x, err %d", addr, size, err);
+        return -1;
+    }
+    return 0;
+}
+
 
 //==================
 int spiffs_mount() {
@@ -724,18 +851,18 @@ int spiffs_mount() {
     int retries = 0;
     int err = 0;
 
-    ESP_LOGI(tag, "Mounting SPIFFS files system");
+    ESP_LOGI(tag, "Mounting SPIFFS file system");
 
-    cfg.phys_addr 		 = CONFIG_SPIFFS_BASE_ADDR;
+    cfg.phys_addr 		 = 0; //CONFIG_SPIFFS_BASE_ADDR;
     cfg.phys_size 		 = CONFIG_SPIFFS_SIZE;
-    cfg.phys_erase_block = SPIFFS_ERASE_SIZE;
-    cfg.log_page_size    = CONFIG_SPIFFS_LOG_PAGE_SIZE;
-    cfg.log_block_size   = CONFIG_SPIFFS_LOG_BLOCK_SIZE;
+    cfg.phys_erase_block = g_rom_flashchip.sector_size; //SPIFFS_ERASE_SIZE;
+    cfg.log_page_size    = g_rom_flashchip.page_size; //CONFIG_SPIFFS_LOG_PAGE_SIZE;
+    cfg.log_block_size   = g_rom_flashchip.sector_size; //CONFIG_SPIFFS_LOG_BLOCK_SIZE;
 
-	cfg.hal_read_f  = (spiffs_read)low_spiffs_read;
-	cfg.hal_write_f = (spiffs_write)low_spiffs_write;
-	cfg.hal_erase_f = (spiffs_erase)low_spiffs_erase;
-
+    cfg.hal_erase_f    = (spiffs_erase)spiffs_api_erase;
+    cfg.hal_read_f     = (spiffs_read)spiffs_api_read;
+    cfg.hal_write_f    = (spiffs_write)spiffs_api_write;
+    
     my_spiffs_work_buf = malloc(cfg.log_page_size * 8);
     if (!my_spiffs_work_buf) {
     	err = 1;
@@ -759,7 +886,7 @@ int spiffs_mount() {
     	goto err_exit;
     }
 
-    ESP_LOGI(tag, "Start address: 0x%x; Size %d KB", cfg.phys_addr, cfg.phys_size / 1024);
+    ESP_LOGI(tag, "Start address: 0x%x; Size %d KB", CONFIG_SPIFFS_BASE_ADDR, cfg.phys_size / 1024);
     ESP_LOGI(tag, "  Work buffer: %d B", cfg.log_page_size * 8);
     ESP_LOGI(tag, "   FDS buffer: %d B", sizeof(spiffs_fd) * SPIFFS_TEMPORAL_CACHE_HIT_SCORE);
     ESP_LOGI(tag, "   Cache size: %d B", cfg.log_page_size * SPIFFS_TEMPORAL_CACHE_HIT_SCORE);
@@ -802,8 +929,6 @@ int spiffs_mount() {
 		goto exit;
     }
 
-    list_init(&files, 0);
-
     ESP_LOGI(tag, "Mounted");
 
     spiffs_is_mounted = 1;
@@ -822,8 +947,22 @@ void vfs_spiffs_register() {
 
 	if (spiffs_is_registered) return;
 
+	if (lock == NULL) {
+		lock = xSemaphoreCreateMutex();
+		if (lock == NULL) {
+            ESP_LOGE(tag, "Error creating SPIFFS mutex");
+			return;
+		}
+	}
+	if (file_lock == NULL) {
+		file_lock = xSemaphoreCreateMutex();
+		if (file_lock == NULL) {
+            ESP_LOGE(tag, "Error creating SPIFFS mutex");
+			return;
+		}
+	}
 	esp_vfs_t vfs = {
-        .fd_offset = 0,
+        //.fd_offset = 0, // not available in latest esp-idf
         .flags = ESP_VFS_FLAG_DEFAULT,
         .write = &vfs_spiffs_write,
         .open = &vfs_spiffs_open,
@@ -844,7 +983,7 @@ void vfs_spiffs_register() {
     ESP_LOGI(tag, "Registering SPIFFS file system");
     esp_err_t res = esp_vfs_register(SPIFFS_BASE_PATH, &vfs, NULL);
     if (res != ESP_OK) {
-        ESP_LOGI(tag, "Error, SPIFFS file system not registered");
+        ESP_LOGE(tag, "Error, SPIFFS file system not registered");
         return;
     }
 	spiffs_is_registered = 1;
