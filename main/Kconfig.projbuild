@@ -1,5 +1,12 @@
 menu "Ymodem Example Configuration"
 
+config EXAMPLE_BAUDRATE
+    int "Uart baudrate"
+    range 38400 921600
+    default 115200
+    help
+	Set the UART baudrate used in the example
+
 config SPIFFS_BASE_ADDR
     hex "SPIFFS Base address"
     range 0x100000 0x1FFE000

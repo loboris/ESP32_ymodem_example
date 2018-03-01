@@ -33,7 +33,7 @@
 
 
 // === Maximal file size we can receive in bytes ===
-#define MAX_FILE_SIZE 800000
+#define MAX_FILE_SIZE (CONFIG_SPIFFS_SIZE - 0x2000)
 
 
 static const char *TAG = "[Ymodem example]";
@@ -446,7 +446,7 @@ void app_main()
 #endif
 
 	uart_config_t uart_config = {
-       .baud_rate = 115200,
+       .baud_rate = CONFIG_EXAMPLE_BAUDRATE,
        .data_bits = UART_DATA_8_BITS,
        .parity = UART_PARITY_DISABLE,
        .stop_bits = UART_STOP_BITS_1,
@@ -468,6 +468,7 @@ void app_main()
 
     //Create a task to handler UART event from ISR
     xTaskCreate(uart_event_task, "uart_event_task", 1024, NULL, 12, NULL);
+    ESP_LOGW(TAG, "UART task created, baudrate=%d.", uart_config.baud_rate);
 
 
 #ifdef CONFIG_EXAMPLE_USE_WIFI
